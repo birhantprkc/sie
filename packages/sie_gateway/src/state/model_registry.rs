@@ -1193,17 +1193,18 @@ impl ModelRegistry {
     /// Resolve the dispatch model id for a grammar-constrained request.
     ///
     /// When a model declares ``tasks.generate.grammar_profile`` (surfaced as
-    /// ``ModelInfoExtras::grammar_profile``), grammar requests must run on the
-    /// ``{base}:{grammar_profile}`` profile variant rather than a speculative
-    /// one — NEXTN/MTP speculative decoding bypasses SGLang's Outlines grammar
+    /// ``ModelInfoExtras::grammar_profile``), incompatible profiles route to
+    /// ``{base}:{grammar_profile}`` rather than a speculative profile —
+    /// NEXTN/MTP speculative decoding bypasses SGLang's Outlines grammar
     /// FSM. An explicit variant may declare a profile-scoped grammar fallback
     /// that preserves its context/hardware/thinking launch shape while
-    /// disabling speculation. A variant that directly inherits the model-wide
-    /// grammar profile and is already safe remains selected.
+    /// disabling speculation. A compatible default profile, or a safe variant
+    /// that directly inherits the model-wide grammar profile, remains selected.
     ///
     /// The routing target is resolved off the request's *base* model, so the
-    /// rewrite fires regardless of which id the caller named:
-    /// - base id (``Qwen/Qwen3.5-4B``)            → ``…:no-spec``
+    /// rewrite applies to incompatible defaults and explicit variants:
+    /// - incompatible base id (``org/grammar-model``) → ``…:no-spec``
+    /// - compatible base id                      → ``Keep``
     /// - sibling variant (``…:a100-40gb``, NEXTN) → ``…:no-spec``
     /// - scoped variant (``…:h200-256k``)         → ``…:h200-256k-no-spec``
     /// - target variant (``…:no-spec``)           → ``Keep`` (already safe)
@@ -1221,6 +1222,13 @@ impl ModelRegistry {
         let Some((base, profile)) = Self::base_grammar_profile(&snap, model) else {
             return GrammarRoute::Keep;
         };
+        if Self::canonical_model_name(&snap, model).as_deref() == Some(base.as_str())
+            && snap.models.get(&base).is_some_and(|entry| {
+                Self::profile_is_grammar_compatible(entry, "default", &profile)
+            })
+        {
+            return GrammarRoute::Keep;
+        }
         let target = format!("{base}:{profile}");
         // The request already names the grammar-safe variant (compare canonical
         // ids so a differently-cased ``…:NO-SPEC`` is still recognised).
@@ -1343,13 +1351,28 @@ impl ModelRegistry {
             Self::profile_loadtime_value(profile, "speculative")
                 .and_then(|value| value.get("enabled")),
             Some(serde_json::Value::Bool(false))
-        )
+        ) && Self::profile_has_no_raw_speculative_overrides(profile)
     }
 
     fn profile_does_not_enable_speculation(profile: &CanonicalProfile) -> bool {
-        match Self::profile_loadtime_value(profile, "speculative") {
+        let typed_safe = match Self::profile_loadtime_value(profile, "speculative") {
             None => true,
             Some(value) => matches!(value.get("enabled"), Some(serde_json::Value::Bool(false))),
+        };
+        typed_safe && Self::profile_has_no_raw_speculative_overrides(profile)
+    }
+
+    fn profile_has_no_raw_speculative_overrides(profile: &CanonicalProfile) -> bool {
+        match Self::profile_loadtime_value(profile, "extra_launch_args") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Array(args)) => args.iter().all(|arg| {
+                arg.as_str().is_some_and(|arg| {
+                    let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
+                    !flag.starts_with("--speculative-")
+                        && !matches!(flag, "--enable-multi-layer-eagle" | "--config")
+                })
+            }),
+            _ => false,
         }
     }
 
@@ -2801,6 +2824,258 @@ mod tests {
         assert_eq!(
             registry.grammar_route_variant("org/scoped-only:safe"),
             GrammarRoute::Keep
+        );
+    }
+
+    #[test]
+    fn test_grammar_route_variant_default_profile() {
+        let config: ModelConfig = serde_yaml::from_str(
+            r#"
+name: org/grammar-model
+tasks:
+  generate:
+    grammar_profile: safe
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    adapter_options:
+      loadtime: {grammar_backend: outlines, speculative: {enabled: false}}
+  safe:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    adapter_options:
+      loadtime: {grammar_backend: outlines, speculative: {enabled: false}}
+  speculative:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    adapter_options:
+      loadtime: {grammar_backend: outlines, speculative: {enabled: true}}
+"#,
+        )
+        .unwrap();
+        let default = config.profiles["default"].clone();
+        let mut cases = vec![("compatible", default.clone(), true)];
+        for (name, field, value, compatible) in [
+            (
+                "fp8",
+                "extra_launch_args",
+                serde_json::json!(["--quantization", "fp8"]),
+                true,
+            ),
+            (
+                "speculation-enabled",
+                "speculative",
+                serde_json::json!({"enabled": true}),
+                false,
+            ),
+            (
+                "speculation-absent",
+                "speculative",
+                serde_json::Value::Null,
+                false,
+            ),
+            (
+                "speculation-malformed",
+                "speculative",
+                serde_json::json!({"enabled": "false"}),
+                false,
+            ),
+            (
+                "backend-mismatch",
+                "grammar_backend",
+                serde_json::json!("xgrammar"),
+                false,
+            ),
+            (
+                "raw-grammar-override",
+                "extra_launch_args",
+                serde_json::json!(["--grammar-backend", "xgrammar"]),
+                false,
+            ),
+            (
+                "raw-speculative-override",
+                "extra_launch_args",
+                serde_json::json!(["--speculative-algo", "NEXTN"]),
+                false,
+            ),
+        ] {
+            let mut profile = default.clone();
+            let loadtime = profile.adapter_options.as_mut().unwrap()["loadtime"]
+                .as_object_mut()
+                .unwrap();
+            if value.is_null() {
+                loadtime.remove(field);
+            } else {
+                loadtime.insert(field.to_string(), value);
+            }
+            cases.push((name, profile, compatible));
+        }
+        let mut different_adapter = default;
+        different_adapter.adapter_path =
+            Some("sie_server.adapters.sentence_transformer:Adapter".to_string());
+        cases.push(("adapter-mismatch", different_adapter, false));
+
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.sglang.generation\n  - sie_server.adapters.sentence_transformer\n",
+        )
+        .unwrap();
+        for (name, profile, compatible) in cases {
+            let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+            let mut config = config.clone();
+            config.profiles.insert("default".to_string(), profile);
+            registry.add_model_config(config).unwrap();
+            let fallback = GrammarRoute::Rewrite("org/grammar-model:safe".to_string());
+            let expected = if compatible {
+                GrammarRoute::Keep
+            } else {
+                fallback.clone()
+            };
+            for model in ["org/grammar-model", "ORG/GRAMMAR-MODEL"] {
+                assert_eq!(
+                    registry.grammar_route_variant(model),
+                    expected,
+                    "{name}: {model}"
+                );
+            }
+            assert_eq!(
+                registry.grammar_route_variant("org/grammar-model:speculative"),
+                fallback,
+                "{name}: speculative sibling",
+            );
+            assert_eq!(
+                registry.grammar_route_variant("org/grammar-model:safe"),
+                GrammarRoute::Keep,
+                "{name}: safe target",
+            );
+        }
+    }
+
+    #[test]
+    fn test_grammar_profiles_reject_matching_raw_speculative_overrides() {
+        let config: ModelConfig = serde_yaml::from_str(
+            r#"
+name: org/grammar-model
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    adapter_options:
+      loadtime: {grammar_backend: outlines, speculative: {enabled: false}}
+  safe:
+    extends: default
+"#,
+        )
+        .unwrap();
+        for args in [
+            serde_json::json!(["--speculative-algorithm", "NEXTN"]),
+            serde_json::json!(["--speculative-algorithm=NEXTN"]),
+            serde_json::json!(["--speculative-algo", "NEXTN"]),
+            serde_json::json!(["--speculative-algo=NEXTN"]),
+            serde_json::json!(["--speculative-draft-model-path", "org/draft"]),
+            serde_json::json!(["--speculative-num-steps", "5"]),
+            serde_json::json!(["--enable-multi-layer-eagle"]),
+            serde_json::json!(["--config", "server.yaml"]),
+            serde_json::json!(["--config=server.yaml"]),
+        ] {
+            let mut config = config.clone();
+            config
+                .profiles
+                .get_mut("default")
+                .unwrap()
+                .adapter_options
+                .as_mut()
+                .unwrap()["loadtime"]["extra_launch_args"] = args.clone();
+            let entry = ModelRegistry::model_entry_from_config(&config).unwrap();
+            assert!(
+                !ModelRegistry::profile_is_grammar_compatible(&entry, "default", "safe"),
+                "matching launch overrides must not establish grammar compatibility: {args}"
+            );
+            config.tasks =
+                Some(serde_yaml::from_str("generate:\n  grammar_profile: safe\n").unwrap());
+            let error = ModelRegistry::model_entry_from_config(&config).unwrap_err();
+            assert!(
+                error.contains("must not enable speculation"),
+                "{args}: {error}"
+            );
+            config.tasks = None;
+            let mut fast = config.profiles["default"].clone();
+            fast.grammar_profile = Some("safe".to_string());
+            config.profiles.insert("fast".to_string(), fast);
+            let error = ModelRegistry::model_entry_from_config(&config).unwrap_err();
+            assert!(
+                error.contains("explicitly disabling speculation"),
+                "{args}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_grammar_target_rejects_raw_speculation_without_typed_settings() {
+        let config: ModelConfig = serde_yaml::from_str(
+            r#"
+name: org/grammar-model
+tasks:
+  generate:
+    grammar_profile: safe
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+  safe:
+    extends: default
+    adapter_options:
+      loadtime:
+        extra_launch_args: [--speculative-algorithm, NEXTN]
+"#,
+        )
+        .unwrap();
+        let error = ModelRegistry::model_entry_from_config(&config).unwrap_err();
+        assert!(error.contains("must not enable speculation"));
+    }
+
+    #[test]
+    fn test_grammar_route_variant_matching_benign_launch_args() {
+        let config: ModelConfig = serde_yaml::from_str(
+            r#"
+name: org/grammar-model
+tasks:
+  generate:
+    grammar_profile: safe
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    adapter_options:
+      loadtime:
+        grammar_backend: outlines
+        speculative: {enabled: false}
+        extra_launch_args: [--log-level, warning, --quantization, fp8]
+  safe:
+    extends: default
+  fast:
+    extends: default
+    adapter_options:
+      loadtime:
+        speculative: {enabled: true}
+"#,
+        )
+        .unwrap();
+        let (_dir, bundles_dir, models_dir) = create_test_dirs();
+        fs::write(
+            bundles_dir.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.sglang.generation\n",
+        )
+        .unwrap();
+        let registry = ModelRegistry::new(&bundles_dir, &models_dir, true);
+        registry.add_model_config(config).unwrap();
+        assert_eq!(
+            registry.grammar_route_variant("org/grammar-model"),
+            GrammarRoute::Keep
+        );
+        assert_eq!(
+            registry.grammar_route_variant("org/grammar-model:safe"),
+            GrammarRoute::Keep
+        );
+        assert_eq!(
+            registry.grammar_route_variant("org/grammar-model:fast"),
+            GrammarRoute::Rewrite("org/grammar-model:safe".to_string())
         );
     }
 
